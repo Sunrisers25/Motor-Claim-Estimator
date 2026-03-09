@@ -11,7 +11,7 @@ Severity levels:
 """
 
 from dataclasses import dataclass
-from typing import Tuple
+from typing import Tuple, Optional
 
 
 @dataclass
@@ -47,23 +47,35 @@ def classify_severity(
         return SeverityResult(label="Minor", score=1, area_ratio=0.0)
 
     ratio = box_area / image_area
+    return severity_from_ratio(ratio)
 
+
+def severity_from_ratio(ratio: float) -> SeverityResult:
+    """
+    Derive a SeverityResult directly from a pre-computed area ratio.
+    Single source of truth — used by both classify_severity() and aggregator.py.
+
+    Parameters
+    ----------
+    ratio : float — bbox_area / image_area (0.0 – 1.0)
+
+    Returns
+    -------
+    SeverityResult
+    """
     if ratio < 0.05:
-        # Small bounding box → Minor
-        score = max(1, int(ratio / 0.05 * 3))  # 1-3
+        score = max(1, int(ratio / 0.05 * 3))   # 1–3
         label = "Minor"
     elif ratio < 0.15:
-        # Medium bounding box → Moderate
-        normalized = (ratio - 0.05) / 0.10    # 0-1 within band
-        score = 4 + int(normalized * 2)        # 4-6
+        normalized = (ratio - 0.05) / 0.10
+        score = 4 + int(normalized * 2)          # 4–6
         label = "Moderate"
     else:
-        # Large bounding box → Severe
         normalized = min((ratio - 0.15) / 0.25, 1.0)
-        score = 7 + int(normalized * 3)        # 7-10
+        score = 7 + int(normalized * 3)          # 7–10
         label = "Severe"
 
-    score = max(1, min(score, 10))             # clamp to [1, 10]
+    score = max(1, min(score, 10))
     return SeverityResult(label=label, score=score, area_ratio=ratio)
 
 

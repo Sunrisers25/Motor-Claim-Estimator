@@ -4,8 +4,10 @@ detection.py
 Car Damage Detection — 3-tier system with high-accuracy AI pipeline
 
 MODE 1: Smart Simulation (demo, offline)
-  OpenCV edge + texture + saturation analysis. Reliably finds 2-4 damage zones
-  on any car damage image. Boxes placed where the photo actually shows damage.
+  OpenCV edge + texture + saturation analysis. Finds real damage zones
+  in the photo using multi-cue analysis. DOES NOT guarantee a minimum
+  number of detections — returns only zones that clear the signal threshold,
+  so an undamaged car gets zero detections (Flaw 1, 2 fixed).
 
 MODE 2: HuggingFace AI Model (high accuracy)
   Downloads keremberke/yolov8m-car-damage-detection automatically.
@@ -14,11 +16,24 @@ MODE 2: HuggingFace AI Model (high accuracy)
 
 MODE 3: Local YOLOv8 (custom weights)
   Use your own fine-tuned model at models/damage_yolov8.pt.
+
+Fixes applied:
+  Flaw  1: Simulation no longer guarantees 2–4 detections (returns 0 if nothing found)
+  Flaw  2: Removed hardcoded fallback boxes at fixed pixel coords
+  Flaw  3: Confidence in simulation reflects actual signal; can go below 0.50
+  Flaw  4: Part variety no longer forced if spatial priors strongly prefer repeated part
+  Flaw  6: PART_PRIORS limitation documented; spatial scoring capped to avoid over-penalising
+  Flaw  7: Model cached via st.session_state to survive Streamlit reruns
+  Flaw  8: User warned when HF mode silently loads local model instead
+  Flaw  9: Generic yolov8n.pt fallback raises RuntimeError instead of silently loading
+  Flaw 10: HF_CLASS_MAP corrected (severe-deformation → dent, not bumper)
+  Flaw 11: Multiple detections on the same part allowed with suffixed names
+  Flaw 12: Confidence calibration no longer over-penalises off-prior-angle shots
 """
 
 import os
-import random
-from typing import List, Dict, Any, Tuple
+import warnings
+from typing import List, Dict, Any, Tuple, Optional
 
 import cv2
 import numpy as np
@@ -34,14 +49,15 @@ MODEL_PATH   = os.path.join(os.path.dirname(__file__), "models", "damage_yolov8.
 
 DAMAGE_CLASSES = ["bumper", "headlight", "door", "windshield", "hood", "scratch", "dent"]
 
-CONFIDENCE_THRESHOLD = 0.25   # lower threshold → more detections for AI mode
+CONFIDENCE_THRESHOLD = 0.25   # lower threshold → more recall for AI mode
 
-# HuggingFace model class → our damage class mapping
+# ── Flaw 10 fix: corrected class map ──────────────────────────────────────────
+# "severe-deformation" was incorrectly mapped to "bumper" (a location, not a type)
 HF_CLASS_MAP: Dict[str, str] = {
     "damage":               "dent",
     "minor-deformation":    "scratch",
     "moderate-deformation": "dent",
-    "severe-deformation":   "bumper",
+    "severe-deformation":   "dent",        # was "bumper" — fixed to damage type
     "scratch":              "scratch",
     "dent":                 "dent",
     "broken":               "headlight",
@@ -51,8 +67,12 @@ HF_CLASS_MAP: Dict[str, str] = {
     "lamp":                 "headlight",
 }
 
-# Spatial priors: where each part typically appears in a front-3/4 or side shot
-# (x_center_frac, y_center_frac, w_frac, h_frac)  — lower y = higher in image
+# ── Spatial priors ─────────────────────────────────────────────────────────────
+# Where each part typically appears in a front-3/4 or side shot.
+# (x_center_frac, y_center_frac, w_frac, h_frac)
+# LIMITATION (Flaw 6 note): These priors assume a front or front-left/right
+# three-quarter view. Rear, interior, and tyre shots will not match well.
+# Spatial scoring is applied as a soft constraint only — kept from Flaw 12 fix.
 PART_PRIORS: Dict[str, Tuple] = {
     "bumper":     (0.50, 0.88, 0.75, 0.22),
     "headlight":  (0.22, 0.55, 0.22, 0.30),
@@ -63,17 +83,28 @@ PART_PRIORS: Dict[str, Tuple] = {
     "dent":       (0.38, 0.70, 0.28, 0.24),
 }
 
+# ── Flaw 12 fix: cap on spatial penalty so off-angle shots aren't over-penalised
+# A score beyond this cap is treated the same as SPATIAL_PENALTY_CAP.
+SPATIAL_PENALTY_CAP = 0.50
+
 # ──────────────────────────────────────────────────────────────────────────────
-# Model loading (lazy, cached)
+# Model loading — Flaw 7 fix: cached in st.session_state to survive reruns
 # ──────────────────────────────────────────────────────────────────────────────
 
-_model = None
+_module_model = None   # fallback for non-Streamlit contexts
 
 
 def _load_model(use_hf: bool) -> Any:
     from ultralytics import YOLO
 
+    # ── Flaw 8 fix: warn user when HF mode silently uses local model ──────────
     if os.path.exists(MODEL_PATH):
+        if use_hf:
+            warnings.warn(
+                "[detection] HuggingFace mode requested but a local model was found at "
+                f"{MODEL_PATH} — using local model instead. Delete it to use HuggingFace.",
+                UserWarning, stacklevel=2,
+            )
         print(f"[detection] Loading local model: {MODEL_PATH}")
         return YOLO(MODEL_PATH)
 
@@ -84,16 +115,30 @@ def _load_model(use_hf: bool) -> Any:
             print("[detection] HuggingFace model ready.")
             return model
         except Exception as e:
-            print(f"[detection] HF load failed: {e}. Falling back to YOLOv8n.")
+            print(f"[detection] HF load failed: {e}.")
 
-    return YOLO("yolov8n.pt")
+    # ── Flaw 9 fix: raise instead of silently loading generic object detector ─
+    raise RuntimeError(
+        "[detection] No suitable model found. Options:\n"
+        "  1. Enable HuggingFace mode (downloads ~100MB on first run).\n"
+        "  2. Place your trained weights at: models/damage_yolov8.pt\n"
+        "  3. Use Smart Simulation mode (no model required)."
+    )
 
 
 def _get_model(use_hf: bool = True) -> Any:
-    global _model
-    if _model is None:
-        _model = _load_model(use_hf)
-    return _model
+    """Return cached model. Uses st.session_state when inside Streamlit."""
+    global _module_model
+    try:
+        import streamlit as st
+        if "detection_model" not in st.session_state:
+            st.session_state["detection_model"] = _load_model(use_hf)
+        return st.session_state["detection_model"]
+    except Exception:
+        # Non-Streamlit context or session_state unavailable
+        if _module_model is None:
+            _module_model = _load_model(use_hf)
+        return _module_model
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -141,12 +186,23 @@ def _nms(detections: List[Dict], iou_threshold: float = 0.45) -> List[Dict]:
 # ──────────────────────────────────────────────────────────────────────────────
 
 def _assign_part(
-    bbox: Tuple, image_w: int, image_h: int,
-    hint_label: str = None, seen_parts: set = None,
+    bbox: Tuple,
+    image_w: int,
+    image_h: int,
+    hint_label: str = None,
+    seen_parts: Optional[set] = None,
+    allow_repeat: bool = False,
 ) -> str:
     """
     Assign the most likely car part to a bounding box using spatial priors.
     hint_label: model-provided label (used as a soft constraint, not hard override).
+
+    Flaw 4 fix: seen_parts avoidance now has a fallback — if ALL remaining parts
+      have a much worse score than the best (already-seen) match, we accept the
+      repeat rather than forcibly assigning a spatially wrong part.
+
+    Flaw 6 note: Priors assume front/three-quarter view. For other angles the
+      spatial scores will all be similarly poor — the hint_label carries more weight.
     """
     x1, y1, x2, y2 = bbox
     cx = (x1 + x2) / 2 / image_w
@@ -156,24 +212,31 @@ def _assign_part(
 
     scores: Dict[str, float] = {}
     for part, (px, py, pw, ph) in PART_PRIORS.items():
-        pos_dist  = ((cx - px) ** 2 + (cy - py) ** 2) ** 0.5
-        size_sim  = abs(bw - pw) + abs(bh - ph)
-        score     = pos_dist * 0.65 + size_sim * 0.35
+        pos_dist = ((cx - px) ** 2 + (cy - py) ** 2) ** 0.5
+        size_sim = abs(bw - pw) + abs(bh - ph)
+        score    = pos_dist * 0.65 + size_sim * 0.35
 
         # Soft boost from model hint
         if hint_label and (hint_label in part or part in hint_label):
-            score *= 0.75   # prefer this part if model hinted it
+            score *= 0.75
 
         scores[part] = score
 
-    # Sort by ascending score (lower = better match)
-    ranked = sorted(scores.items(), key=lambda x: x[1])
+    ranked = sorted(scores.items(), key=lambda x: x[1])  # lower = better
 
-    # Avoid repeating the same part (prefer variety)
-    if seen_parts:
-        for part, _ in ranked:
+    if not allow_repeat and seen_parts:
+        best_unseen = None
+        for part, s in ranked:
             if part not in seen_parts:
-                return part
+                best_unseen = (part, s)
+                break
+
+        # Flaw 4 fix: only use unseen part if it's within 2× the best score.
+        # If all unseen parts are much worse spatially, repeat the best part
+        # (suffixing is handled by the caller in AI mode).
+        best_score = ranked[0][1]
+        if best_unseen and best_unseen[1] <= best_score * 2.0:
+            return best_unseen[0]
 
     return ranked[0][0]
 
@@ -186,6 +249,9 @@ def _find_damage_zones(image: np.ndarray) -> List[Tuple]:
     """
     Locate high-damage-probability zones via multi-cue OpenCV analysis.
     Returns sorted list of (score, x1, y1, x2, y2).
+
+    Flaw 1, 2 fix: no minimum zone count enforced, no hardcoded fallback boxes.
+    Only zones that clear the minimum signal threshold are returned.
     """
     h, w = image.shape[:2]
     gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
@@ -195,8 +261,8 @@ def _find_damage_zones(image: np.ndarray) -> List[Tuple]:
     edges = cv2.Canny(blur, 30, 120).astype(np.float32) / 255.0
 
     # --- Cue 2: Local texture variance (Laplacian magnitude) ---
-    lap   = np.abs(cv2.Laplacian(gray, cv2.CV_64F)).astype(np.float32)
-    lap  /= (lap.max() + 1e-6)
+    lap  = np.abs(cv2.Laplacian(gray, cv2.CV_64F)).astype(np.float32)
+    lap /= (lap.max() + 1e-6)
 
     # --- Cue 3: Saturation anomaly (paint damage = low saturation) ---
     hsv  = cv2.cvtColor(image, cv2.COLOR_RGB2HSV)
@@ -204,7 +270,7 @@ def _find_damage_zones(image: np.ndarray) -> List[Tuple]:
     val  = hsv[:, :, 2].astype(np.float32) / 255.0
     sat_dev = np.abs(sat - sat.mean())
 
-    # --- Cue 4: Brightness irregularity (shiny exposed metal = bright patches) ---
+    # --- Cue 4: Brightness irregularity (exposed metal = bright patches) ---
     bright_anom = np.abs(val - val.mean())
 
     # Weighted combination
@@ -214,18 +280,20 @@ def _find_damage_zones(image: np.ndarray) -> List[Tuple]:
     # --- Extract peaks using adaptive suppression ---
     zones    = []
     used     = np.zeros((h, w), dtype=np.float32)
-    min_size = int(min(w, h) * 0.10)   # minimum box dimension 10% of image
+    min_size = int(min(w, h) * 0.10)
 
-    for _ in range(6):   # search up to 6 peaks
-        # Suppress already-claimed areas
+    # Flaw 1, 2 fix: raised minimum signal threshold; no guaranteed minimum zones
+    MIN_SIGNAL = 0.08   # previously 0.04 — tighter to avoid noise detections
+
+    for _ in range(6):
         search = prob * (1.0 - used)
         _, peak_val, _, peak_loc = cv2.minMaxLoc(search)
 
-        if peak_val < 0.04:   # very low signal, stop
-            break
+        if peak_val < MIN_SIGNAL:
+            break   # nothing significant left — stop, don't add fallbacks
 
         cx, cy = peak_loc
-        local  = edges[max(0, cy-50):cy+50, max(0, cx-50):cx+50]
+        local   = edges[max(0, cy-50):cy+50, max(0, cx-50):cx+50]
         density = local.mean()
 
         # Adaptive box size based on local edge density
@@ -242,7 +310,6 @@ def _find_damage_zones(image: np.ndarray) -> List[Tuple]:
         if (x2 - x1) > 10 and (y2 - y1) > 10:
             zones.append((float(peak_val), x1, y1, x2, y2))
 
-        # Suppress this region
         suppress_r = max(bw, bh) // 2
         cv2.circle(used, (cx, cy), suppress_r, 1.0, -1)
 
@@ -253,28 +320,24 @@ def _smart_simulation(image: np.ndarray) -> List[Dict[str, Any]]:
     """
     Image-aware simulation: finds actual damage zones in the photo using
     multi-cue OpenCV analysis, assigns realistic part labels via spatial priors.
-    Always returns 2–4 detections.
+
+    Flaw 1, 2 fix: returns 0 detections on undamaged images instead of
+    inventing fake damage boxes. The caller in app.py handles the empty case.
+
+    Flaw 3 fix: confidence range now covers [0.20, 0.97] proportional to
+    actual signal strength; can go below 0.50 for weak signals.
     """
     h, w   = image.shape[:2]
     zones  = _find_damage_zones(image)
 
-    # Guarantee at least 2 zones — add fallback zones if needed
-    if len(zones) < 2:
-        # Fallback: lower bumper region and front headlight region
-        fallbacks = [
-            (0.08, w // 4, int(h * 0.6), 3 * w // 4, h - 5),
-            (0.06, 5,      int(h * 0.3), w // 3,      int(h * 0.7)),
-        ]
-        for fb in fallbacks:
-            if len(zones) >= 2:
-                break
-            zones.append(fb)
+    if not zones:
+        return []   # Flaw 1, 2 fix: no fallback fabrication
 
     # Keep top 4 by score
     zones = sorted(zones, key=lambda z: z[0], reverse=True)[:4]
 
-    detections  = []
-    seen_parts:set = set()
+    detections: List[Dict] = []
+    seen_parts: set = set()
 
     for score, x1, y1, x2, y2 in zones:
         bbox     = (x1, y1, x2, y2)
@@ -282,10 +345,11 @@ def _smart_simulation(image: np.ndarray) -> List[Dict[str, Any]]:
         seen_parts.add(part)
         severity = classify_severity(bbox, w, h)
 
-        # Confidence from zone prominence + small random jitter for realism
-        prominence = min(score * 3.0, 1.0)
-        conf = round(0.52 + prominence * 0.40 + random.uniform(-0.03, 0.03), 2)
-        conf = max(0.50, min(conf, 0.97))
+        # Flaw 3 fix: confidence reflects actual signal in [0.20, 0.97]
+        # No artificial floor at 0.50 — weak-signal zones get low confidence
+        # which allows the decision engine's low-confidence override to fire.
+        conf = round(min(score * 2.5, 0.97), 2)
+        conf = max(0.20, conf)
 
         detections.append({
             "part_name":  part,
@@ -305,11 +369,16 @@ def _calibrate_confidence(raw_conf: float, spatial_score: float) -> float:
     """
     Calibrate raw model confidence using spatial agreement.
     If the model's detection position strongly agrees with spatial priors,
-    boost confidence; if it conflicts, slightly reduce it.
-    spatial_score: 0.0 (perfect match) to 1.0+ (poor match)
+    boost confidence; if it conflicts, apply only a mild reduction.
+
+    Flaw 12 fix: spatial_score is capped at SPATIAL_PENALTY_CAP before
+    being used, so detections from non-front-view angles (where all priors
+    are far away) are not excessively down-scored.
     """
-    spatial_agreement = max(0, 1.0 - spatial_score)
-    calibrated = raw_conf * 0.70 + spatial_agreement * 0.30
+    capped_score = min(spatial_score, SPATIAL_PENALTY_CAP)
+    spatial_agreement = max(0, 1.0 - capped_score / SPATIAL_PENALTY_CAP)
+    # Blended: 80% raw model confidence, 20% spatial agreement bonus
+    calibrated = raw_conf * 0.80 + spatial_agreement * 0.20
     return round(min(calibrated, 0.98), 3)
 
 
@@ -323,8 +392,12 @@ def _ai_detections(
       1. Run YOLOv8 inference (HuggingFace or local)
       2. Map class labels → our 7 damage classes
       3. Apply spatial part assignment (with model hint)
-      4. Calibrate confidence using spatial agreement
+      4. Calibrate confidence using spatial agreement (Flaw 12 fix: capped penalty)
       5. Apply NMS to remove overlapping redundant boxes
+
+    Flaw 11 fix: multiple detections on the same part are allowed.
+      When a part has already been seen, a numeric suffix is added
+      (e.g., "door", "door_2") so the aggregator can treat them separately.
     """
     model = _get_model(use_hf)
     h, w  = image.shape[:2]
@@ -337,7 +410,7 @@ def _ai_detections(
     )
 
     raw_dets: List[Dict] = []
-    seen_parts: set      = set()
+    part_counts: Dict[str, int] = {}   # Flaw 11: track how many times each part seen
 
     for result in results:
         for box in (result.boxes or []):
@@ -362,12 +435,24 @@ def _ai_detections(
             if x2 <= x1 or y2 <= y1:
                 continue
 
-            # Spatial part assignment with model hint
-            part = _assign_part((x1, y1, x2, y2), w, h,
-                                hint_label=hint, seen_parts=seen_parts)
-            seen_parts.add(part)
+            # Flaw 11, 4 fix: allow repeated parts; use allow_repeat when needed
+            seen_set = set(part_counts.keys())
+            part = _assign_part(
+                (x1, y1, x2, y2), w, h,
+                hint_label=hint,
+                seen_parts=seen_set,
+                allow_repeat=False,
+            )
 
-            # Calibrate using spatial score
+            # If this part was already assigned, suffix it (_2, _3 …)
+            if part in part_counts:
+                part_counts[part] += 1
+                part_label = f"{part}_{part_counts[part]}"
+            else:
+                part_counts[part] = 1
+                part_label = part
+
+            # Calibrate using spatial score (Flaw 12 fix: capped)
             prior_px, prior_py, _, _ = PART_PRIORS[part]
             cx_norm = (x1 + x2) / 2 / w
             cy_norm = (y1 + y2) / 2 / h
@@ -380,7 +465,7 @@ def _ai_detections(
             severity = classify_severity((x1, y1, x2, y2), w, h)
 
             raw_dets.append({
-                "part_name":  part,
+                "part_name":  part_label,
                 "confidence": cal_conf,
                 "bbox":       (x1, y1, x2, y2),
                 "severity":   severity,
@@ -420,12 +505,15 @@ def detect_damage(
     Returns
     -------
     List of dicts: { part_name, confidence, bbox, severity }
+    May be empty if no damage is found (Flaw 1, 2 fix).
     """
     if use_simulation:
         return _smart_simulation(image)
 
     try:
         return _ai_detections(image, confidence_threshold, use_hf=use_hf_model)
+    except RuntimeError:
+        raise   # Flaw 9 fix: propagate "no model" error to surface it to the user
     except Exception as e:
         print(f"[detection] AI pipeline error ({e}) — falling back to smart simulation.")
         return _smart_simulation(image)
@@ -453,7 +541,8 @@ def draw_detections(
 
     for det in detections:
         x1, y1, x2, y2 = det["bbox"]
-        part  = det["part_name"].capitalize()
+        # Strip suffix (_2, _3) for display label
+        display_part = det["part_name"].split("_")[0].capitalize()
         conf  = det["confidence"]
         sev   = det["severity"].label
         color = SEVERITY_COLORS.get(sev, (255, 255, 255))
@@ -461,7 +550,7 @@ def draw_detections(
 
         cv2.rectangle(annotated, (x1, y1), (x2, y2), color, thick)
 
-        label = f"{part} | {sev} | {conf:.0%}"
+        label = f"{display_part} | {sev} | {conf:.0%}"
         font  = cv2.FONT_HERSHEY_SIMPLEX
         fscale, fthick = 0.58, 1
         (tw, th), _ = cv2.getTextSize(label, font, fscale, fthick)

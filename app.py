@@ -253,16 +253,24 @@ def draw_heatmap(image: np.ndarray, detections: List[Dict]) -> np.ndarray:
     return heatmap
 
 
-# ── Build image list ───────────────────────────────────────────────────────────
+# ── Build image list ─────────────────────────────────────────────────────────
+# Flaw 23 fix: demo and uploaded images are strictly separated — loading both
+# at once would silently mix a stock photo with the real claim photos.
 image_sources: List[tuple] = []
-if load_demo and os.path.exists(DEMO_IMAGE_PATH):
-    with open(DEMO_IMAGE_PATH, "rb") as f:
-        image_sources.append(("demo_car_damage.png", f.read()))
-elif load_demo:
-    st.warning("⚠️ Demo image not found. Make sure `demo_car_damage.png` is in the project folder.")
-
-for uf in uploaded_files:
-    image_sources.append((uf.name, uf.read()))
+if load_demo:
+    if uploaded_files:
+        st.warning(
+            "⚠️ **Demo mode**: Uploaded files are ignored while the demo image is loaded. "
+            "Clear the demo or remove your uploads to analyze your own images."
+        )
+    if os.path.exists(DEMO_IMAGE_PATH):
+        with open(DEMO_IMAGE_PATH, "rb") as f:
+            image_sources.append(("demo_car_damage.png", f.read()))
+    else:
+        st.warning("⚠️ Demo image not found. Make sure `demo_car_damage.png` is in the project folder.")
+else:
+    for uf in uploaded_files:
+        image_sources.append((uf.name, uf.read()))
 
 # ── Process ────────────────────────────────────────────────────────────────────
 if image_sources:
@@ -387,7 +395,9 @@ if image_sources:
 
     # Attach repair/replace recommendations (Feature 11)
     for det in aggregated:
-        rec = recommend_action(det["part_name"], det["severity"].label, det["severity"].area_ratio)
+        # Strip numeric suffix added for multi-damage parts (e.g. "door_2" → "door")
+        base_part = det["part_name"].split("_")[0]
+        rec = recommend_action(base_part, det["severity"].label, det["severity"].area_ratio)
         det["action"]        = rec.action
         det["justification"] = rec.justification
         det["rec_icon"]      = rec.icon
@@ -404,8 +414,21 @@ if image_sources:
     st.markdown('<p class="section-title">💰 Cost Estimation</p>', unsafe_allow_html=True)
 
     estimate = estimate_costs(aggregated, car_type=car_type)
-    decision = decide_claim(estimate.grand_total, detections=aggregated)
-    claim_id = f"CLM-{datetime.now().strftime('%Y%m%d')}-{str(uuid.uuid4())[:6].upper()}"
+
+    # Flaw 22 fix: pass raw (pre-aggregation) detections for confidence check.
+    # Aggregated detections have averaged confidences which can mask wide variance;
+    # raw detections give a truer picture of detection quality across all images.
+    decision = decide_claim(estimate.grand_total, detections=all_raw_detections)
+
+    # Flaw 24 fix: generate claim_id once per analysis session and cache it in
+    # st.session_state. Streamlit reruns the whole script on every widget change,
+    # so without caching a new UUID would be generated (and saved to DB) each time.
+    session_key = f"claim_id_{'_'.join(f for f, _ in image_sources)}"
+    if session_key not in st.session_state:
+        st.session_state[session_key] = (
+            f"CLM-{datetime.now().strftime('%Y%m%d')}-{str(uuid.uuid4())[:6].upper()}"
+        )
+    claim_id = st.session_state[session_key]
 
     # KPI tiles
     m1, m2, m3, m4 = st.columns(4)
